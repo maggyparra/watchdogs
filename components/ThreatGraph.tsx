@@ -1,8 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Incident } from '../types';
 
-// Declare Leaflet global type
-declare const L: any;
+// Leaflet will be available globally from the CDN script in index.html
 
 interface ThreatGraphProps {
   incidents: Incident[];
@@ -19,6 +18,20 @@ const ThreatGraph: React.FC<ThreatGraphProps> = ({ incidents, onSelect }) => {
   
   useEffect(() => {
     if (!mapContainerRef.current) return;
+
+    // Wait for Leaflet to be available (with retry)
+    const initMap = () => {
+      if (typeof window === 'undefined' || !(window as any).L) {
+        // Retry after a short delay if Leaflet isn't loaded yet
+        setTimeout(initMap, 100);
+        return;
+      }
+
+      const L = (window as any).L;
+      if (!L) {
+        console.error('Leaflet library not loaded. Make sure Leaflet is included in index.html');
+        return;
+      }
 
     // Initialize Map if not exists
     if (!mapInstanceRef.current) {
@@ -106,12 +119,15 @@ const ThreatGraph: React.FC<ThreatGraphProps> = ({ incidents, onSelect }) => {
       bounds.extend([lat, lng]);
     });
 
-    // Fit bounds to show all incidents + context
-    if (incidents.length > 0) {
-      mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
-    } else {
-      mapInstanceRef.current.setView(DEFAULT_CENTER, 12);
-    }
+      // Fit bounds to show all incidents + context
+      if (incidents.length > 0) {
+        mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
+      } else {
+        mapInstanceRef.current.setView(DEFAULT_CENTER, 12);
+      }
+    };
+
+    initMap();
 
     // Cleanup on unmount
     return () => {
@@ -119,12 +135,11 @@ const ThreatGraph: React.FC<ThreatGraphProps> = ({ incidents, onSelect }) => {
        // Usually better to keep the instance or handle cleanup carefully.
        // mapInstanceRef.current.remove();
     };
-
   }, [incidents, onSelect]);
 
   return (
-    <div className="w-full h-full relative bg-black">
-      <div id="map" ref={mapContainerRef} className="w-full h-full z-0 outline-none" />
+    <div className="w-full h-full relative bg-black" style={{ height: '100%', width: '100%' }}>
+      <div id="map" ref={mapContainerRef} className="w-full h-full z-0 outline-none" style={{ height: '100%', width: '100%', minHeight: '400px' }} />
       
       <div className="absolute top-4 left-4 z-[400] pointer-events-none">
         <h3 className="text-white font-bold tracking-widest uppercase text-sm bg-black/80 px-3 py-1 border-l-2 border-white backdrop-blur-md">

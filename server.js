@@ -48,8 +48,8 @@ app.get('/api/x/search', async (req, res) => {
       max_results: max_results,
       'tweet.fields': 'created_at,author_id,public_metrics,attachments,entities',
       expansions: 'author_id,attachments.media_keys',
-      'media.fields': 'type,url,preview_image_url',
-      'user.fields': 'username,name,verified',
+      'media.fields': 'type,url,preview_image_url,media_key,height,width',
+      'user.fields': 'username,name,verified,profile_image_url',
     };
 
     const requestData = {

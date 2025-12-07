@@ -85,7 +85,7 @@ export function xApiProxy(): Plugin {
             max_results: maxResults,
             'tweet.fields': 'created_at,author_id,public_metrics,attachments,entities',
             expansions: 'author_id,attachments.media_keys',
-            'media.fields': 'type,url,preview_image_url',
+            'media.fields': 'type,url,preview_image_url,media_key,height,width',
             'user.fields': 'username,name,verified,profile_image_url',
           };
 

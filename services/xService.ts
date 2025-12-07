@@ -142,14 +142,31 @@ const searchTweets = async (query: string, maxResults: number = 100): Promise<an
       const errorText = await response.text();
       let errorMessage = `X API Error: ${response.status}`;
       
-      if (response.status === 401) {
-        errorMessage = "X API Authentication failed. Please check your API key.";
-      } else if (response.status === 429) {
-        errorMessage = "X API Rate limit exceeded. Please try again later.";
-      } else if (response.status === 403) {
-        errorMessage = "X API Access forbidden. Please check your API permissions.";
+      try {
+        const errorData = JSON.parse(errorText);
+        if (errorData.error) {
+          errorMessage = errorData.error;
+        } else if (errorData.errors && errorData.errors.length > 0) {
+          errorMessage = errorData.errors.map((e: any) => e.message || e.detail).join(', ');
+        }
+      } catch (e) {
+        // If error text is not JSON, use the text as is
+        if (errorText) {
+          errorMessage = errorText.substring(0, 200);
+        }
       }
       
+      if (response.status === 401) {
+        errorMessage = `X API Authentication failed (401). ${errorMessage}. Please check your API credentials in .env.local.`;
+      } else if (response.status === 429) {
+        errorMessage = `X API Rate limit exceeded (429). ${errorMessage}. Please wait a few minutes and try again.`;
+      } else if (response.status === 403) {
+        errorMessage = `X API Access forbidden (403). ${errorMessage}. Please check your API permissions.`;
+      } else if (response.status === 500 || response.status >= 502) {
+        errorMessage = `X API Server error (${response.status}). ${errorMessage}. The X API may be experiencing issues.`;
+      }
+      
+      console.error(`X API Search Error [${response.status}]:`, errorMessage);
       throw new Error(errorMessage);
     }
 
@@ -163,7 +180,19 @@ const searchTweets = async (query: string, maxResults: number = 100): Promise<an
     // Map tweets with author and media information
     const tweets = data.data || [];
     if (!Array.isArray(tweets)) {
+      console.warn('X API returned non-array data:', data);
       return [];
+    }
+    
+    // Debug: Log first tweet to verify we're getting real data
+    if (tweets.length > 0) {
+      console.log('Sample tweet from X API:', {
+        id: tweets[0].id,
+        text: tweets[0].text?.substring(0, 50),
+        likes: tweets[0].public_metrics?.like_count,
+        hasMedia: !!tweets[0].attachments?.media_keys?.length,
+        authorId: tweets[0].author_id
+      });
     }
     
     const users = (data.includes?.users || []).reduce((acc: any, user: any) => {
@@ -176,15 +205,22 @@ const searchTweets = async (query: string, maxResults: number = 100): Promise<an
     const media = (data.includes?.media || []).reduce((acc: any, m: any) => {
       if (m && m.media_key) {
         acc[m.media_key] = m;
+        // Debug: Log media to verify URLs
+        if (m.url || m.preview_image_url) {
+          console.log('Media found:', { type: m.type, url: m.url, previewUrl: m.preview_image_url });
+        }
       }
       return acc;
     }, {});
 
     // Filter unrelated posts - keep only posts relevant to incidents
+    // More lenient filtering to catch real incidents
     const relevantKeywords = [
       'shooting', 'shots fired', 'active shooter', 'emergency', 'police', 'SWAT',
       'evacuate', 'incident', 'alert', 'crime', 'arrest', 'suspect', 'victim',
-      'hospital', 'ambulance', 'fire', 'explosion', 'threat', 'danger', 'lockdown'
+      'hospital', 'ambulance', 'fire', 'explosion', 'threat', 'danger', 'lockdown',
+      'breaking', 'officer', 'respond', 'scene', 'investigation', 'homicide',
+      'stabbing', 'assault', 'robbery', 'weapon', 'gun', 'violence'
     ];
     
     const filteredTweets = tweets.filter((tweet: any) => {
@@ -195,14 +231,22 @@ const searchTweets = async (query: string, maxResults: number = 100): Promise<an
       const hasRelevantKeyword = relevantKeywords.some(keyword => text.includes(keyword));
       const isVerified = users[tweet.author_id]?.verified;
       
-      // Keep if it has relevant keywords OR is from verified account
-      return hasRelevantKeyword || isVerified;
+      // Keep if it has relevant keywords OR is from verified account OR has high engagement
+      const hasEngagement = (tweet.public_metrics?.like_count || 0) > 10 || 
+                           (tweet.public_metrics?.retweet_count || 0) > 5;
+      
+      return hasRelevantKeyword || isVerified || hasEngagement;
     });
     
     return filteredTweets
       .map((tweet: any) => {
         const author = users[tweet.author_id];
-        const tweetMedia = (tweet.attachments?.media_keys || [])
+        // Extract media - handle both media_keys in attachments and entities.media
+        const mediaKeys = tweet.attachments?.media_keys || [];
+        const entityMedia = tweet.entities?.media?.map((m: any) => m.media_key).filter(Boolean) || [];
+        const allMediaKeys = [...new Set([...mediaKeys, ...entityMedia])];
+        
+        const tweetMedia = allMediaKeys
           .map((key: string) => media[key])
           .filter((m: any) => m && (m.url || m.preview_image_url));
         
@@ -229,7 +273,7 @@ const searchTweets = async (query: string, maxResults: number = 100): Promise<an
             views: tweet.public_metrics?.impression_count || 0,
           },
           media: tweetMedia.map((m: any) => ({
-            type: (m.type === 'photo' ? 'photo' : m.type === 'video' ? 'video' : 'gif') as 'photo' | 'video' | 'gif',
+            type: (m.type === 'photo' ? 'photo' : m.type === 'video' ? 'video' : m.type === 'animated_gif' ? 'gif' : 'photo') as 'photo' | 'video' | 'gif',
             url: m.url || m.preview_image_url || '',
             previewUrl: m.preview_image_url || m.url || '',
           })),
@@ -785,29 +829,45 @@ const groupPostsByIncident = (posts: XPost[]): Array<{ posts: XPost[]; location:
   }));
 };
 
-// Search shootings by city and date
-const searchByCity = async (city: string, daysBack: number = 7): Promise<XPost[]> => {
-  const dateStr = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-  const query = `(shooting OR "shots fired" OR "active shooter") ${city} -is:retweet lang:en`;
+// Search incidents by city - broader real-time search
+const searchByCity = async (city: string, hoursBack: number = 24): Promise<XPost[]> => {
+  // Use broader search terms to catch real incidents
+  const queries = [
+    `(shooting OR "shots fired" OR "active shooter" OR gunfire) ${city} -is:retweet lang:en`,
+    `(police OR emergency OR incident OR crime) ${city} -is:retweet lang:en`,
+    `(breaking OR alert OR "police activity") ${city} -is:retweet lang:en`,
+  ];
 
-  try {
-    const tweets = await searchTweets(query, 100);
-    return tweets.map(tweet => ({
-      id: tweet.id,
-      text: tweet.text,
-      author: tweet.author,
-      url: tweet.url,
-      timestamp: tweet.timestamp,
-      engagement: tweet.engagement,
-      media: tweet.media || [],
-    }));
-  } catch (error) {
-    console.error(`Error searching ${city}:`, error);
-    return [];
+  const allTweets: XPost[] = [];
+  
+  for (const query of queries) {
+    try {
+      const tweets = await searchTweets(query, 100);
+      tweets.forEach(tweet => {
+        // Avoid duplicates
+        if (!allTweets.find(t => t.id === tweet.id)) {
+          allTweets.push({
+            id: tweet.id,
+            text: tweet.text,
+            author: tweet.author,
+            url: tweet.url,
+            timestamp: tweet.timestamp,
+            engagement: tweet.engagement,
+            media: tweet.media || [],
+          });
+        }
+      });
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } catch (error) {
+      console.error(`Error searching ${city} with query "${query}":`, error);
+    }
   }
+  
+  return allTweets;
 };
 
-// Search police department accounts for shooting reports
+// Search police department accounts for incident reports - broader terms
 const searchPoliceReports = async (): Promise<XPost[]> => {
   const policeAccounts = [
     'from:SJPD',
@@ -820,12 +880,17 @@ const searchPoliceReports = async (): Promise<XPost[]> => {
     'from:CupertinoPD',
     'from:SunnyvalePD',
     'from:FremontPD',
-    'from:MilpitasPD'
+    'from:MilpitasPD',
+    'from:SFPD',
+    'from:OaklandPD',
+    'from:SFPDAlerts'
   ];
   
-  const queries = policeAccounts.map(account => 
-    `${account} (shooting OR "shots fired" OR "active shooter" OR homicide) -is:retweet lang:en`
-  );
+  // Broader search terms to catch more incidents
+  const queries = policeAccounts.flatMap(account => [
+    `${account} (shooting OR "shots fired" OR "active shooter" OR homicide) -is:retweet lang:en`,
+    `${account} (incident OR emergency OR alert OR crime) -is:retweet lang:en`
+  ]);
   
   try {
     const allResults = await Promise.all(
@@ -847,14 +912,14 @@ const searchPoliceReports = async (): Promise<XPost[]> => {
   }
 };
 
-// Helper function to filter posts with low engagement (any metric < 5)
+// Helper function to filter posts with very low engagement (at least one metric should be > 0)
+// This is much more lenient to allow real posts through
 const filterLowEngagementPosts = (posts: XPost[]): XPost[] => {
   return posts.filter(post => {
     const engagement = post.engagement;
-    return engagement.likes >= 5 && 
-           engagement.retweets >= 5 && 
-           engagement.replies >= 5 && 
-           engagement.quotes >= 5;
+    // Keep posts that have at least some engagement (likes OR retweets OR replies > 0)
+    // This ensures we get real posts while filtering out completely inactive ones
+    return (engagement.likes > 0 || engagement.retweets > 0 || engagement.replies > 0 || engagement.views > 0);
   });
 };
 
@@ -872,13 +937,12 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         '"Westfield Valley Fair" shooting',
         '"Valley Fair" shooting',
         'Valley Fair Mall shooting',
-        'Westfield Valley Fair shooting December 2025',
+        'Westfield Valley Fair shooting',
         'Valley Fair shooting San Jose',
         // San Jose + mall shooting
-        'San Jose mall shooting December 2025',
-        'San Jose mall shooting December 2',
-        'Santa Clara mall shooting December 2025',
-        'South Bay mall shooting December',
+        'San Jose mall shooting',
+        'Santa Clara mall shooting',
+        'South Bay mall shooting',
         // Black Friday related
         'Black Friday shooting Valley Fair',
         'Black Friday shooting San Jose mall',
@@ -897,11 +961,11 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'ABC7 Los Angeles Valley Fair',
         'NBC Bay Area Valley Fair',
         // Additional variations
-        'Westfield Valley Fair incident December',
-        'Valley Fair shooting news December 2',
-        'San Jose Valley Fair shooting December',
+        'Westfield Valley Fair incident',
+        'Valley Fair shooting news',
+        'San Jose Valley Fair shooting',
         'Santa Clara Valley Fair shooting',
-        'South Bay shooting December 2025'
+        'South Bay shooting'
       ]
     },
     {
@@ -918,10 +982,10 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'Burton Academic High School shooting',
         'Burton High School San Francisco shooting',
         // San Francisco + school shooting
-        'San Francisco school shooting December 2025',
-        'San Francisco school shooting December 2',
-        'SF school shooting December 2025',
-        'SFUSD shooting December 2025',
+        'San Francisco school shooting ',
+        'San Francisco school shooting ',
+        'SF school shooting ',
+        'SFUSD shooting ',
         'SFUSD Burton shooting',
         // Police department
         'from:SFPD Burton High School',
@@ -957,16 +1021,16 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Man found fatally shot while sitting inside his car on Turk Street at ~6:12 a.m. Police investigating as homicide. NBC Bay Area. San Francisco Police Department.",
       searchQueries: [
         // Direct location variations
-        'Tenderloin shooting Turk Street December 2025',
-        'Tenderloin shooting Turk Street December 2',
-        'Turk Street shooting Tenderloin December 2025',
+        'Tenderloin shooting Turk Street ',
+        'Tenderloin shooting Turk Street ',
+        'Turk Street shooting Tenderloin ',
         'Turk Street homicide Tenderloin',
         'Tenderloin fatal shooting Turk Street',
-        'Tenderloin shooting car December 2025',
+        'Tenderloin shooting car ',
         // San Francisco + homicide/shooting
         'San Francisco homicide Turk Street',
-        'San Francisco homicide December 2025',
-        'San Francisco homicide December 2',
+        'San Francisco homicide ',
+        'San Francisco homicide ',
         'SF homicide Turk Street',
         'San Francisco fatal shooting Tenderloin',
         'SF fatal shooting Tenderloin',
@@ -974,7 +1038,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'from:SFPD Tenderloin shooting',
         'from:SFPD Turk Street',
         'from:SFPD homicide December',
-        'SFPD Tenderloin shooting December 2',
+        'SFPD Tenderloin shooting ',
         'SFPD Turk Street homicide',
         'San Francisco Police Department Tenderloin',
         // News sources
@@ -991,7 +1055,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'fatal shooting car Turk Street',
         'homicide car Tenderloin',
         // Additional variations
-        'Tenderloin homicide December 2025',
+        'Tenderloin homicide ',
         'Turk Street homicide December',
         'San Francisco Tenderloin homicide'
       ]
@@ -1004,7 +1068,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Man from San Leandro shot at around 10:00 p.m. on the 5900 block of Market Street; he later died at hospital. Police responded after automated gunfire detection alert. SFGATE.",
       searchQueries: [
         // Direct location variations
-        'Oakland shooting Market Street December 2025',
+        'Oakland shooting Market Street ',
         'North Oakland shooting 5900 Market Street',
         'Oakland shooting Market Street December 5',
         'Market Street Oakland shooting December',
@@ -1033,7 +1097,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'Oakland shooting night December 5',
         'Market Street shooting night Oakland',
         // Additional variations
-        'North Oakland shooting December 2025',
+        'North Oakland shooting ',
         'Oakland East Bay shooting December',
         'Market Street Oakland homicide December'
       ]
@@ -1046,10 +1110,10 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Shooting near the Safeway / Great Highway + Fulton Street left five people wounded (a mix of juveniles and at least one adult); one man was in life-threatening condition. Police believe it stemmed from a fight. ABC7 San Francisco. Los Angeles Times.",
       searchQueries: [
         // Direct location variations
-        'Outer Richmond shooting Safeway November 2025',
+        'Outer Richmond shooting Safeway ',
         'Great Highway Fulton Street shooting November',
         'Safeway Great Highway shooting San Francisco',
-        'Outer Richmond shooting November 8',
+        'Outer Richmond shooting ',
         'Great Highway shooting Fulton Street November',
         // 5 wounded
         'Outer Richmond shooting 5 wounded',
@@ -1071,10 +1135,10 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'Los Angeles Times Outer Richmond',
         'from:latimes San Francisco shooting',
         // Additional variations
-        'Outer Richmond shooting November 2025',
+        'Outer Richmond shooting ',
         'Great Highway Fulton shooting November',
         'San Francisco Outer Richmond shooting',
-        'Richmond District shooting November 8'
+        'Richmond District shooting '
       ]
     },
     {
@@ -1085,14 +1149,14 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Juvenile student was shot on campus around 1:30 p.m.; two juvenile suspects were taken into custody and two guns recovered. The student is expected to survive. KTVU FOX 2 San Francisco. KQED.",
       searchQueries: [
         // Direct school name variations
-        'Skyline High School shooting November 2025',
-        'Skyline High School shooting November 12',
+        'Skyline High School shooting ',
+        'Skyline High School shooting ',
         'Skyline High School Oakland shooting',
         'Oakland Skyline High School shooting',
         // Student shot
         'Skyline High School student shot',
-        'Oakland school shooting November 2025',
-        'Oakland school shooting November 12',
+        'Oakland school shooting ',
+        'Oakland school shooting ',
         'Skyline High School campus shooting',
         // Juvenile suspects
         'Skyline High School juvenile suspects',
@@ -1109,9 +1173,9 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'from:KQED Oakland school',
         'KQED Skyline High School shooting',
         // Additional variations
-        'Oakland high school shooting November 2025',
+        'Oakland high school shooting ',
         'Skyline High School incident November',
-        'Oakland school shooting November 12'
+        'Oakland school shooting '
       ]
     },
     {
@@ -1122,8 +1186,8 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Senior athletics-staff member was shot inside the college's field house. The shooting came one day after the Skyline High School shooting. Police investigated; the victim was hospitalized. AP News. Wikipedia.",
       searchQueries: [
         // Direct location variations
-        'Laney College shooting November 2025',
-        'Laney College shooting November 13',
+        'Laney College shooting ',
+        'Laney College shooting ',
         'Laney College field house shooting',
         'Laney College Oakland shooting',
         'Oakland Laney College shooting',
@@ -1141,8 +1205,8 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'AP News Laney College shooting',
         'Wikipedia Laney College shooting',
         // Additional variations
-        'Oakland college shooting November 2025',
-        'Laney College shooting November 13',
+        'Oakland college shooting ',
+        'Laney College shooting ',
         'Oakland community college shooting'
       ]
     },
@@ -1154,7 +1218,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "The staff-member shot above later died after being shot; suspect arrested. The victim was a well-known former coach and athletics director. Wikipedia. The Guardian.",
       searchQueries: [
         // Fatal shooting
-        'Laney College shooting death November 2025',
+        'Laney College shooting death ',
         'Laney College staff member died',
         'Laney College fatal shooting November',
         'Laney College coach died shooting',
@@ -1173,9 +1237,9 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'from:guardian Laney College',
         'The Guardian Laney College shooting',
         // Additional variations
-        'Laney College shooting November 14',
+        'Laney College shooting ',
         'Oakland college shooting death November',
-        'Laney College homicide November 2025'
+        'Laney College homicide '
       ]
     },
     {
@@ -1186,14 +1250,14 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
       description: "Mass shooting at a children's birthday-party event: 4 people killed (3 children) and many more wounded. The shooting appears targeted; multiple shooters suspected. AP News. Wikipedia.",
       searchQueries: [
         // Direct location variations
-        'Monkey Space Stockton shooting November 2025',
+        'Monkey Space Stockton shooting ',
         'Monkey Space event hall shooting',
-        'Stockton Monkey Space shooting November 29',
+        'Stockton Monkey Space shooting ',
         'Stockton event hall shooting November',
         'Monkey Space birthday party shooting',
         // Mass shooting
-        'Stockton mass shooting November 2025',
-        'Stockton mass shooting November 29',
+        'Stockton mass shooting ',
+        'Stockton mass shooting ',
         'Monkey Space mass shooting',
         'Stockton birthday party mass shooting',
         // 4 killed, 3 children
@@ -1218,7 +1282,7 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         'Stockton children birthday party shooting',
         'San Joaquin County mass shooting November',
         'Stockton event hall mass shooting',
-        'Monkey Space Stockton November 29'
+        'Monkey Space Stockton '
       ]
     }
   ];
@@ -1248,28 +1312,17 @@ const fetchHardcodedIncidents = async (): Promise<Incident[]> => {
         }
       }
 
-      // Filter out posts with low engagement (any metric < 5)
+      // Filter out posts with very low engagement
       let posts = Array.from(postsMap.values());
       posts = filterLowEngagementPosts(posts);
 
-      // For hardcoded incidents, still create them even if no posts found
-      // (they're important incidents that should always be shown)
+      // Only create placeholder if we truly have NO posts after searching all queries
+      // This should rarely happen if the API is working correctly
       if (posts.length === 0) {
-        // Create a placeholder post with the incident description
-        // This ensures the incident is always displayed
-        const placeholderPost: XPost = {
-          id: `hardcoded-${incidentData.title}`,
-          text: incidentData.description,
-          author: {
-            username: 'system',
-            name: 'System',
-            verified: false
-          },
-          url: '#',
-          timestamp: incidentData.timestamp,
-          engagement: { likes: 5, retweets: 5, replies: 5, quotes: 5, views: 0 }
-        };
-        posts.push(placeholderPost);
+        console.warn(`No posts found for incident: ${incidentData.title}. This may indicate API issues or the incident is too old.`);
+        // Don't create placeholder - skip this incident if no real data
+        // This ensures we only show incidents with actual X API data
+        continue;
       }
 
       // Calculate metrics
@@ -1349,9 +1402,11 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
         const anchoredLocation = group.location;
         
         const sentiment = analyzeSentiment(posts);
-        const isReliable = sentiment.sentiment !== 'negative' && (sentiment.verifiedCount > 0 || sentiment.confidence > 0.6);
+        // More lenient reliability check - allow posts with at least 1 post if it has engagement
+        const isReliable = sentiment.sentiment !== 'negative' && (sentiment.verifiedCount > 0 || sentiment.confidence > 0.6 || posts.length >= 1);
         
-        if (!isReliable && posts.length < 5) {
+        // Only skip if we have very few posts AND they're not reliable
+        if (!isReliable && posts.length < 2) {
           return;
         }
         
@@ -1523,7 +1578,7 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
       }) };
     }
     
-    // Default: Search all Bay Area cities separately + police reports
+    // Default: Search all Bay Area cities separately + police reports + general Bay Area search
     const bayAreaCities = [
       'San Jose',
       'Palo Alto',
@@ -1541,11 +1596,37 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
       'Valley Fair'
     ];
     
-    // Search each city in parallel + police reports
-    const [citySearches, policeReports] = await Promise.all([
-      Promise.all(bayAreaCities.map(city => searchByCity(city, 7))),
-      searchPoliceReports()
+    // Add general Bay Area real-time searches
+    const generalBayAreaQueries = [
+      '(shooting OR "shots fired" OR "active shooter" OR gunfire) (Bay Area OR "San Francisco Bay" OR "SF Bay") -is:retweet lang:en',
+      '(police OR emergency OR incident) (Bay Area OR "San Francisco Bay") -is:retweet lang:en',
+      '(breaking OR alert) (Bay Area OR "San Francisco Bay") -is:retweet lang:en',
+    ];
+    
+    console.log('Searching for real-time incidents in Bay Area...');
+    
+    // Search each city in parallel + police reports + general Bay Area
+    const [citySearches, policeReports, generalSearches] = await Promise.all([
+      Promise.all(bayAreaCities.map(city => searchByCity(city, 24))),
+      searchPoliceReports(),
+      Promise.all(generalBayAreaQueries.map(query => {
+        return searchTweets(query, 100).then(tweets => tweets.map(tweet => ({
+          id: tweet.id,
+          text: tweet.text,
+          author: tweet.author,
+          url: tweet.url,
+          timestamp: tweet.timestamp,
+          engagement: tweet.engagement,
+          media: tweet.media || [],
+        }))).catch(err => {
+          console.error(`Error in general search "${query}":`, err);
+          return [];
+        });
+      }))
     ]);
+    
+    const allGeneralPosts = generalSearches.flat();
+    console.log(`Found ${citySearches.flat().length} posts from city searches, ${policeReports.length} police reports, and ${allGeneralPosts.length} from general Bay Area searches`);
     
     // Combine all posts and remove duplicates
     const allPostsMap = new Map<string, XPost>();
@@ -1566,10 +1647,20 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
       }
     });
     
-    // Filter out posts with any engagement metric < 5
+    // Add general Bay Area search results
+    allGeneralPosts.forEach(post => {
+      if (!allPostsMap.has(post.id)) {
+        allPostsMap.set(post.id, post);
+      }
+    });
+    
+    // Filter out posts with very low engagement (but be lenient)
     const allPosts = filterLowEngagementPosts(Array.from(allPostsMap.values()));
     
+    console.log(`After filtering: ${allPosts.length} posts with engagement`);
+    
     if (allPosts.length === 0) {
+      console.warn('No posts found with engagement. Returning hardcoded incidents only.');
       // Still return hardcoded incidents even if no other posts found
       return { incidents: hardcodedIncidents };
     }
@@ -1586,11 +1677,12 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
       // Analyze sentiment and verify accuracy
       const sentiment = analyzeSentiment(posts);
       
-      // Only include if sentiment is positive (confirmed) or neutral, and has verified sources
-      const isReliable = sentiment.sentiment !== 'negative' && (sentiment.verifiedCount > 0 || sentiment.confidence > 0.6);
+      // More lenient reliability check - allow real-time incidents with engagement
+      const isReliable = sentiment.sentiment !== 'negative' && (sentiment.verifiedCount > 0 || sentiment.confidence > 0.6 || posts.length >= 1);
       
-      if (!isReliable && posts.length < 5) {
-        return; // Skip unreliable incidents with few sources
+      // Only skip if we have very few posts AND they're not reliable
+      if (!isReliable && posts.length < 2) {
+        return; // Skip unreliable incidents with very few sources
       }
       
       // Calculate metrics - use anchored location from grouping
@@ -1761,6 +1853,8 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
     // Merge hardcoded incidents with regular incidents
     const allIncidents = [...hardcodedIncidents, ...incidents];
     
+    console.log(`Total incidents found: ${allIncidents.length} (${hardcodedIncidents.length} hardcoded, ${incidents.length} real-time)`);
+    
     return {
       incidents: allIncidents.sort((a, b) => {
         // Sort by severity and engagement
@@ -1774,9 +1868,27 @@ export const fetchRealTimeIncidents = async (query: string = ""): Promise<FetchI
       }),
     };
     
-  } catch (error) {
-    console.error("X API Error:", error);
-    throw error;
+  } catch (error: any) {
+    console.error("X API Error in fetchRealTimeIncidents:", error);
+    
+    // Provide more detailed error messages
+    let errorMessage = "Failed to fetch incidents from X API.";
+    
+    if (error.message) {
+      if (error.message.includes("Authentication failed") || error.message.includes("401")) {
+        errorMessage = "X API Authentication failed. Please check your API credentials in .env.local file.";
+      } else if (error.message.includes("Rate limit") || error.message.includes("429")) {
+        errorMessage = "X API Rate limit exceeded. Please wait a few minutes and try again.";
+      } else if (error.message.includes("Access forbidden") || error.message.includes("403")) {
+        errorMessage = "X API Access forbidden. Please check your API permissions and ensure you have access to the Twitter API v2.";
+      } else if (error.message.includes("Connection") || error.message.includes("network")) {
+        errorMessage = "Network error connecting to X API. Please check your internet connection.";
+      } else {
+        errorMessage = `X API Error: ${error.message}`;
+      }
+    }
+    
+    throw new Error(errorMessage);
   }
 };
 
