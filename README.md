@@ -1,3 +1,5 @@
+## Watch Dogs 🐕
+
 **Watch Dogs** is a real-time AI-powered emergency intelligence platform that monitors X, verifies breaking incidents using Grok AI, and delivers **clear, actionable alerts to first responders in under 30 seconds**.
 
 We turn **social media chaos into verified emergency intelligence** by:
