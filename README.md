@@ -1,3 +1,14 @@
+**Watch Dogs** is a real-time AI-powered emergency intelligence platform that monitors X, verifies breaking incidents using Grok AI, and delivers **clear, actionable alerts to first responders in under 30 seconds**.
+
+We turn **social media chaos into verified emergency intelligence** by:
+- Detecting incidents as they unfold
+- Clustering related posts into single events
+- Cross-referencing government alerts and news
+- Assigning transparent confidence scores
+- Displaying everything on a live map + feed dashboard
+
+**Built for police officers and first responders**, Watch Dogs eliminates doomscrolling, reduces misinformation, and helps save lives when every second counts.
+
 ## Run Locally
 
 **Prerequisites:**  Node.js
